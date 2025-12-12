@@ -1,0 +1,7 @@
+strands-agents
+streamlit
+boto3
+langdetect
+faiss-cpu
+pypdf2
+python-docx

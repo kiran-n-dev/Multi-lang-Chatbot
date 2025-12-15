@@ -3,9 +3,12 @@
 import os
 from typing import List, Tuple
 from io import BytesIO
+from langdetect import detect
 from rag.utils import chunk_text
 from rag.embeddings import embed_texts
 from rag.vectorstore_faiss import FaissStore
+from parsers.pdf_parser import parse_pdf_bytes
+from parsers.docx_parser import parse_docx_bytes
 from config.settings import DATA_DIR, FAISS_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
 # Parsers
@@ -47,17 +50,33 @@ def load_documents() -> List[Tuple[str, dict]]:
             path = os.path.join(root, f)
             low = f.lower()
             try:
-                if low.endswith(".txt"):
+                if low.endswith(".pdf"):
+                    with open(path, "rb") as fh:
+                        blocks = parse_pdf_bytes(fh.read(), path)
+                elif low.endswith(".docx"):
+                    with open(path, "rb") as fh:
+                        blocks = parse_docx_bytes(fh.read(), path)
+                elif low.endswith(".txt"):
                     content = read_txt(path)
+                    lang = detect(content) if content.strip() else "en"
+                    docs.append((content, {"source": path, "lang": lang}))
+                    continue
                 elif low.endswith(".md"):
                     content = read_md(path)
-                elif low.endswith(".pdf"):
-                    content = read_pdf(path)
-                elif low.endswith(".docx"):
-                    content = read_docx(path)
+                    lang = detect(content) if content.strip() else "en"
+                    docs.append((content, {"source": path, "lang": lang}))
+                    continue
                 else:
                     continue
-                docs.append((content, {"source": path}))
+                
+                for block in blocks:
+                    if "plain_text" in block and block["plain_text"] is not None:
+                        lang = detect(block["plain_text"]) if block["plain_text"].strip() else "en"
+                        block["lang"] = lang
+                        docs.append((block["plain_text"], block))
+                    else:
+                        # For tables, etc., add with empty text for now
+                        docs.append(("", block))
             except Exception as e:
                 print(f"Failed to parse {path}: {e}")
     return docs
@@ -65,11 +84,17 @@ def load_documents() -> List[Tuple[str, dict]]:
 def _index_chunks(chunks: List[str], metas: List[dict]) -> int:
     if not chunks:
         return 0
-    vectors = embed_texts(chunks)
+    # Filter out empty chunks to avoid embedding errors
+    valid_indices = [i for i, c in enumerate(chunks) if c.strip()]
+    if not valid_indices:
+        return 0
+    valid_chunks = [chunks[i] for i in valid_indices]
+    valid_metas = [metas[i] for i in valid_indices]
+    vectors = embed_texts(valid_chunks)
     store = FaissStore(dim=len(vectors[0]), persist_dir=FAISS_DIR)
-    store.add(vectors, chunks, metas)
+    store.add(vectors, valid_chunks, valid_metas)
     store.save()
-    return len(chunks)
+    return len(valid_chunks)
 
 # CLI build index from DATA_DIR
 def build_index():
@@ -103,24 +128,44 @@ def ingest_uploaded_files(files) -> int:
         # Parse
         low = filename.lower()
         try:
-            if low.endswith(".txt") or low.endswith(".md"):
-                content = read_txt(dest)
-            elif low.endswith(".pdf"):
+            if low.endswith(".pdf"):
                 with open(dest, "rb") as fh:
-                    content = read_pdf_bytes(fh.read())
+                    blocks = parse_pdf_bytes(fh.read(), dest)
             elif low.endswith(".docx"):
                 with open(dest, "rb") as fh:
-                    content = read_docx_bytes(fh.read())
+                    blocks = parse_docx_bytes(fh.read(), dest)
+            elif low.endswith(".txt"):
+                content = read_txt(dest)
+                lang = detect(content) if content.strip() else "en"
+                cks = chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
+                all_chunks.extend(cks)
+                metas.extend([{"source": dest, "lang": lang}] * len(cks))
+                continue
+            elif low.endswith(".md"):
+                content = read_md(dest)
+                lang = detect(content) if content.strip() else "en"
+                cks = chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
+                all_chunks.extend(cks)
+                metas.extend([{"source": dest, "lang": lang}] * len(cks))
+                continue
             else:
                 # Skip unsupported types (UI restricts types already)
                 continue
+            
+            for block in blocks:
+                if "plain_text" in block and block["plain_text"] is not None:
+                    lang = detect(block["plain_text"]) if block["plain_text"].strip() else "en"
+                    block["lang"] = lang
+                    cks = chunk_text(block["plain_text"], CHUNK_SIZE, CHUNK_OVERLAP)
+                    all_chunks.extend(cks)
+                    metas.extend([block] * len(cks))
+                else:
+                    # For tables, store without chunking
+                    all_chunks.append("")  # Empty text for embedding
+                    metas.append(block)
         except Exception as e:
             print(f"Failed to parse uploaded {filename}: {e}")
             continue
-
-        cks = chunk_text(content, CHUNK_SIZE, CHUNK_OVERLAP)
-        all_chunks.extend(cks)
-        metas.extend([{"source": dest}] * len(cks))
 
     return _index_chunks(all_chunks, metas)
 
